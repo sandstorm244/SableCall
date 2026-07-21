@@ -9,6 +9,7 @@ import {
   type Participant,
   ParticipantEvent,
   type LocalParticipant,
+  type LocalTrack,
   type ScreenShareCaptureOptions,
   type TrackPublishOptions,
   RoomEvent,
@@ -341,20 +342,109 @@ export const createLocalMembership$ = ({
   //  - stop publishing
   //  - destruct all current streams
   //  - overwrite current publisher
+  // Screen share tracks detached from a destroyed publisher, waiting to be
+  // adopted by its replacement. The capture is kept alive across connection
+  // switches because re-publishing a live track needs no user gesture, while
+  // re-acquiring the capture would.
+  let survivingScreenShareTracks: LocalTrack[] = [];
+  // True while detached tracks are held here (the gap between a publisher
+  // being destroyed and its replacement adopting the share).
+  const survivingHandover$ = new BehaviorSubject(false);
+  // The publish options the current share was started with; re-used when
+  // re-publishing it on a replacement connection.
+  let activeScreenSharePublishOptions: TrackPublishOptions | undefined;
+  // Set when the user turns the share off while its tracks are mid-detach
+  // (inside the reconcile cleanup, visible to nobody); applied when the
+  // detach lands so the share cannot resurrect after a stop.
+  let screenShareDiscardRequested = false;
+  // Bumped whenever the user starts a NEW share. A detach that started under
+  // an older generation must drop its tracks: they belong to a share the
+  // user has since stopped (and possibly replaced), even if the discard flag
+  // was cleared again by the new share starting.
+  let screenShareGeneration = 0;
+  let scopeEnded = false;
+  let surviveTimeout: ReturnType<typeof setTimeout> | undefined;
+  const stopSurvivingScreenShareTracks = (): void => {
+    if (surviveTimeout !== undefined) {
+      clearTimeout(surviveTimeout);
+      surviveTimeout = undefined;
+    }
+    for (const track of survivingScreenShareTracks) track.stop();
+    survivingScreenShareTracks = [];
+    survivingHandover$.next(false);
+  };
   scope.reconcile(localConnection$, async (connection) => {
     logger.info(
       "reconcile based on new localConnection:",
       connection?.transport.livekit_service_url,
     );
-    if (connection !== null) {
-      const publisher = createPublisherFactory(connection);
-      publisher$.next(publisher);
-
-      // Clean-up callback
-      return Promise.resolve(async (): Promise<void> => {
-        await publisher.destroy();
-      });
+    if (connection === null) {
+      // The transport is gone. Keep the capture alive briefly in case it
+      // comes right back (transport blips), but never indefinitely.
+      if (survivingScreenShareTracks.length > 0 && surviveTimeout === undefined)
+        surviveTimeout = setTimeout(() => {
+          logger.info(
+            "Transport did not return; stopping the surviving screen share capture",
+          );
+          stopSurvivingScreenShareTracks();
+        }, 30_000);
+      return;
     }
+    if (surviveTimeout !== undefined) {
+      clearTimeout(surviveTimeout);
+      surviveTimeout = undefined;
+    }
+    const publisher = createPublisherFactory(connection);
+    publisher$.next(publisher);
+
+    if (survivingScreenShareTracks.length > 0) {
+      const tracks = survivingScreenShareTracks;
+      survivingScreenShareTracks = [];
+      publisher.adoptScreenShareTracks(
+        tracks,
+        activeScreenSharePublishOptions,
+      );
+      survivingHandover$.next(false);
+    }
+
+    // Clean-up callback
+    return Promise.resolve(async (): Promise<void> => {
+      // Raise the handover flag synchronously (before any await) so
+      // sharingScreen$ cannot read false — and the toggle cannot invert —
+      // while the detach is in progress.
+      if (publisher.hasScreenShareToHandOver()) survivingHandover$.next(true);
+      const generationAtDetach = screenShareGeneration;
+      try {
+        survivingScreenShareTracks = await publisher.detachScreenShareTracks();
+      } catch (e) {
+        logger.error("Failed to detach screen share tracks", e);
+      }
+      try {
+        await publisher.destroy();
+      } catch (e) {
+        logger.error("Failed to destroy publisher", e);
+      }
+      // The scope may have ended, or the user may have turned the share off
+      // (or off and a new one on: generation mismatch), while we were
+      // detaching — all of those run before this async cleanup lands, so
+      // re-check here.
+      if (
+        scopeEnded ||
+        screenShareDiscardRequested ||
+        screenShareGeneration !== generationAtDetach
+      ) {
+        screenShareDiscardRequested = false;
+        stopSurvivingScreenShareTracks();
+      } else {
+        survivingHandover$.next(survivingScreenShareTracks.length > 0);
+      }
+    });
+  });
+  // If the call ends without a replacement publisher adopting the detached
+  // tracks, stop the capture rather than leaking it.
+  scope.onEnd(() => {
+    scopeEnded = true;
+    stopSurvivingScreenShareTracks();
   });
 
   // Use reconcile here to not run concurrent createAndSetupTracks calls
@@ -700,11 +790,25 @@ export const createLocalMembership$ = ({
     });
 
   /**
-   * Whether the user is currently sharing their screen.
+   * Whether the user is currently sharing their screen. This includes shares
+   * that are mid-handover between connections (detached or waiting to be
+   * re-published), so the UI does not flicker to "not sharing" and the toggle
+   * cannot invert during a connection switch.
    */
   const sharingScreen$ = scope.behavior(
-    participant$.pipe(
-      switchMap((p) => (p !== null ? observeSharingScreen$(p) : of(false))),
+    combineLatest([
+      participant$.pipe(
+        switchMap((p) => (p !== null ? observeSharingScreen$(p) : of(false))),
+      ),
+      publisher$.pipe(
+        switchMap((p) => p?.pendingScreenShare$ ?? of(false)),
+      ),
+      survivingHandover$,
+    ]).pipe(
+      map(
+        ([participantSharing, pendingPublish, handover]) =>
+          participantSharing || pendingPublish || handover,
+      ),
     ),
   );
 
@@ -737,8 +841,6 @@ export const createLocalMembership$ = ({
           screenShareResolution.getValue(),
         );
         const fps = screenShareFramerate.getValue();
-        const bps = screenShareBitrate.getValue();
-        const codec = screenShareCodec.getValue();
 
         screenshareSettings.resolution = {
           width,
@@ -746,13 +848,7 @@ export const createLocalMembership$ = ({
           frameRate: fps,
         };
 
-        publishOptions = {
-          screenShareEncoding: {
-            maxBitrate: bps,
-            maxFramerate: fps,
-          },
-          videoCodec: codec,
-        };
+        publishOptions = buildScreenSharePublishOptions();
       } else {
         // Fall back to config.json settings if available
         const screenConf = Config.get().media_quality?.screen_share;
@@ -771,6 +867,21 @@ export const createLocalMembership$ = ({
           targetScreenshareState ? "On" : "Off"
         }`,
       );
+      if (targetScreenshareState) {
+        // Remember the options so that a handover after a connection switch
+        // re-publishes with what the share was actually started with.
+        activeScreenSharePublishOptions = publishOptions;
+        screenShareDiscardRequested = false;
+        screenShareGeneration += 1;
+      } else {
+        // Turning off: also drop any capture that is mid-handover between
+        // connections, which setScreenShareEnabled cannot see. Tracks that
+        // are currently inside a detach are caught via the request flag when
+        // the detach lands.
+        screenShareDiscardRequested = true;
+        stopSurvivingScreenShareTracks();
+        publisher$.value?.discardPendingScreenShare();
+      }
       // If a connection is ready, toggle screen sharing.
       // We deliberately do nothing in the case of a null connection because
       // it looks nice for the call control buttons to all become available
@@ -808,6 +919,21 @@ export const createLocalMembership$ = ({
     internalLoggerRef: logger,
   };
 };
+
+/**
+ * The publish options a screen share should currently use, honouring the
+ * advanced screen share settings.
+ */
+function buildScreenSharePublishOptions(): TrackPublishOptions | undefined {
+  if (!advancedScreenShare.getValue()) return undefined;
+  return {
+    screenShareEncoding: {
+      maxBitrate: screenShareBitrate.getValue(),
+      maxFramerate: screenShareFramerate.getValue(),
+    },
+    videoCodec: screenShareCodec.getValue(),
+  };
+}
 
 export function observeSharingScreen$(p: Participant): Observable<boolean> {
   return observeParticipantEvents(

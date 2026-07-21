@@ -8,13 +8,17 @@ Please see LICENSE in the repository root for full details.
 import {
   ConnectionState as LivekitConnectionState,
   type LocalAudioTrack,
+  type LocalTrack,
   type LocalTrackPublication,
   LocalVideoTrack,
   ParticipantEvent,
   type Room as LivekitRoom,
+  RoomEvent,
   Track,
+  type TrackPublishOptions,
 } from "livekit-client";
 import {
+  BehaviorSubject,
   combineLatest,
   distinctUntilChanged,
   map,
@@ -72,6 +76,40 @@ export class Publisher {
   private rnnoisePolicySyncedTrack: LocalAudioTrack | null = null;
 
   /**
+   * Screen share tracks adopted from a previous publisher (see
+   * adoptScreenShareTracks) that have not been re-published yet.
+   */
+  private pendingScreenShare: {
+    tracks: LocalTrack[];
+    publishOptions?: TrackPublishOptions;
+  } | null = null;
+  /**
+   * Tracks whose re-publish call is currently in flight, mapped to that
+   * publish promise. They are in neither pendingScreenShare nor the room's
+   * publications during this time; detach awaits the promise so the handover
+   * fully settles before it returns.
+   */
+  private readonly inFlightScreenShare = new Map<LocalTrack, Promise<unknown>>();
+  /**
+   * Tracks taken over by a replacement publisher (via detachScreenShareTracks)
+   * while their re-publish was still in flight. The publish continuation must
+   * not stop or keep them.
+   */
+  private readonly stolenScreenShareTracks = new WeakSet<LocalTrack>();
+  /**
+   * Whether this publisher is holding a screen share that has not been
+   * re-published yet. Merged into sharingScreen$ so the UI does not flicker
+   * to "not sharing" during a connection handover.
+   */
+  public readonly pendingScreenShare$ = new BehaviorSubject<boolean>(false);
+  /** Single-flight guard for publishPendingScreenShare. */
+  private publishingPendingScreenShare = false;
+  /** Resolves when this publisher's scope ends, to abort waits. */
+  private readonly scopeEnded = new Promise<void>((resolve) =>
+    this.scope.onEnd(resolve),
+  );
+
+  /**
    * Creates a new Publisher.
    * @param connection - The connection to use for publishing.
    * @param devices - The media devices to use for audio and video input.
@@ -113,6 +151,10 @@ export class Publisher {
     this.logger.info("Scope ended -> unset handler");
     this.muteStates.audio.unsetHandler();
     this.muteStates.video.unsetHandler();
+
+    // Normally a caller detaches the screen share before destroying us; this
+    // covers destroy without detach so a stashed capture can never leak.
+    this.discardPendingScreenShare();
 
     this.logger.info(`Start to stop tracks`);
     try {
@@ -287,6 +329,12 @@ export class Publisher {
     } catch (e) {
       this.logger.error(`Failed to resume upstreams`, e);
     }
+
+    // Re-publish any screen share tracks carried over from a previous
+    // connection (see adoptScreenShareTracks). Deliberately not awaited:
+    // livekit defers the publish until the room's signal connection is up,
+    // which must not block the publishing reconcile loop.
+    void this.publishPendingScreenShare();
   }
 
   public async stopPublishing(): Promise<void> {
@@ -307,12 +355,209 @@ export class Publisher {
       Track.Source.Microphone,
       Track.Source.Camera,
       Track.Source.ScreenShare,
+      Track.Source.ScreenShareAudio,
     ]) {
       const localPub = lkRoom.localParticipant.getTrackPublication(source);
       if (localPub?.track) {
-        // stops and unpublishes the track
-        await lkRoom.localParticipant.unpublishTrack(localPub!.track, true);
+        // Stops and unpublishes the track — except for tracks a replacement
+        // publisher has taken over (a stolen track's deferred publish may
+        // have landed here after the detach), which must keep capturing.
+        const stop = !this.stolenScreenShareTracks.has(localPub.track);
+        await lkRoom.localParticipant.unpublishTrack(localPub.track, stop);
       }
+    }
+  }
+
+  /**
+   * Unpublish any active screen share tracks WITHOUT stopping their capture,
+   * and return them so a replacement publisher can adopt them. Re-publishing a
+   * live track needs no user gesture, unlike re-acquiring the capture with
+   * getDisplayMedia, so this lets a screen share survive a connection switch.
+   * Tracks that were adopted but not (or not yet) re-published are returned
+   * too; in-flight re-publishes are marked as stolen so their continuations
+   * leave the tracks alone.
+   */
+  public async detachScreenShareTracks(): Promise<LocalTrack[]> {
+    const detached: LocalTrack[] = this.pendingScreenShare?.tracks ?? [];
+    this.pendingScreenShare = null;
+    const lkRoom = this.connection.livekitRoom;
+    // Steal in-flight publishes, then wait for them to settle and release
+    // their publications HERE, so no late continuation can outlive the
+    // handover (a late release could otherwise unpublish the very
+    // publication a same-room replacement publisher just took over).
+    const inFlight = [...this.inFlightScreenShare.entries()];
+    this.inFlightScreenShare.clear();
+    for (const [track, publishPromise] of inFlight) {
+      this.stolenScreenShareTracks.add(track);
+      if (!detached.includes(track)) detached.push(track);
+      await publishPromise.catch(() => {});
+      try {
+        if (lkRoom.localParticipant.getTrackPublication(track.source)?.track === track)
+          await lkRoom.localParticipant.unpublishTrack(track, false);
+      } catch (e) {
+        this.logger.error("Failed to release settled in-flight track", e);
+      }
+    }
+    for (const source of [
+      Track.Source.ScreenShare,
+      Track.Source.ScreenShareAudio,
+    ]) {
+      const track = lkRoom.localParticipant.getTrackPublication(source)?.track;
+      if (!track) continue;
+      // Hand the track over even if the unpublish fails (the old room is
+      // being torn down anyway) — dropping it here would leave a live
+      // capture that nothing references.
+      if (!detached.includes(track)) detached.push(track);
+      try {
+        await lkRoom.localParticipant.unpublishTrack(track, false);
+      } catch (e) {
+        this.logger.error(`Failed to detach ${source} track`, e);
+      }
+    }
+    this.updatePendingScreenShareSignal();
+    const live = detached.filter(
+      (track) => track.mediaStreamTrack?.readyState === "live",
+    );
+    for (const track of detached) if (!live.includes(track)) track.stop();
+    return live;
+  }
+
+  /**
+   * Whether this publisher currently owns a screen share in any form:
+   * published, stashed for re-publish, or with a publish in flight. Used to
+   * raise the handover flag synchronously before an (async) detach.
+   */
+  public hasScreenShareToHandOver(): boolean {
+    const participant = this.connection.livekitRoom.localParticipant;
+    return (
+      this.pendingScreenShare !== null ||
+      this.inFlightScreenShare.size > 0 ||
+      participant.getTrackPublication(Track.Source.ScreenShare)?.track !==
+        undefined ||
+      participant.getTrackPublication(Track.Source.ScreenShareAudio)?.track !==
+        undefined
+    );
+  }
+
+  /**
+   * Take over screen share tracks detached from a previous publisher. Tracks
+   * whose capture has ended in the meantime are stopped and dropped; the rest
+   * are re-published as soon as this publisher is publishing.
+   */
+  public adoptScreenShareTracks(
+    tracks: LocalTrack[],
+    publishOptions?: TrackPublishOptions,
+  ): void {
+    const live = tracks.filter(
+      (track) => track.mediaStreamTrack?.readyState === "live",
+    );
+    for (const track of tracks) if (!live.includes(track)) track.stop();
+    if (live.length === 0) return;
+    this.pendingScreenShare = { tracks: live, publishOptions };
+    this.pendingScreenShare$.next(true);
+    if (this.shouldPublish) void this.publishPendingScreenShare();
+  }
+
+  /**
+   * Stop and drop any screen share tracks waiting to be re-published, e.g.
+   * because the user turned the share off during a connection handover.
+   */
+  public discardPendingScreenShare(): void {
+    for (const track of this.pendingScreenShare?.tracks ?? []) track.stop();
+    this.pendingScreenShare = null;
+    for (const track of this.inFlightScreenShare.keys()) {
+      this.stolenScreenShareTracks.add(track);
+      track.stop();
+    }
+    this.inFlightScreenShare.clear();
+    this.updatePendingScreenShareSignal();
+  }
+
+  private updatePendingScreenShareSignal(): void {
+    this.pendingScreenShare$.next(
+      this.pendingScreenShare !== null || this.inFlightScreenShare.size > 0,
+    );
+  }
+
+  private async publishPendingScreenShare(): Promise<void> {
+    // Single-flight: adopt/startPublishing may both kick this off; a running
+    // loop picks up anything newly stashed via its while condition.
+    if (this.publishingPendingScreenShare) return;
+    this.publishingPendingScreenShare = true;
+    try {
+      const lkRoom = this.connection.livekitRoom;
+      while (this.shouldPublish && this.pendingScreenShare !== null) {
+        if (lkRoom.state !== LivekitConnectionState.Connected) {
+          // Publishing while disconnected would make livekit defer the
+          // publish with an internal 15s timeout that STOPS the track — fatal
+          // for a capture that may since have been handed to a newer
+          // publisher. Wait for the connection instead. The wait is released
+          // by any state change, the scope ending, or the stash being taken
+          // (detach/discard), all re-checked by the loop.
+          await new Promise<void>((resolve) => {
+            const onState = (): void => {
+              lkRoom.off(RoomEvent.ConnectionStateChanged, onState);
+              resolve();
+            };
+            lkRoom.on(RoomEvent.ConnectionStateChanged, onState);
+            void this.scopeEnded.then(onState);
+          });
+          continue;
+        }
+        // Take ONE track at a time so a concurrent detach/discard always
+        // finds the rest of the batch still in the stash.
+        const pending = this.pendingScreenShare;
+        const [track, ...rest] = pending.tracks;
+        this.pendingScreenShare =
+          rest.length > 0 ? { ...pending, tracks: rest } : null;
+        // Re-check liveness at publish time: the capture may have ended (e.g.
+        // via the browser's "stop sharing" bar) while the track was stashed.
+        if (track.mediaStreamTrack?.readyState !== "live") {
+          track.stop();
+          this.updatePendingScreenShareSignal();
+          continue;
+        }
+        const source =
+          track.kind === Track.Kind.Video
+            ? Track.Source.ScreenShare
+            : Track.Source.ScreenShareAudio;
+        const options: TrackPublishOptions =
+          source === Track.Source.ScreenShare
+            ? { ...pending.publishOptions, source }
+            : { source };
+        try {
+          const publishPromise = lkRoom.localParticipant.publishTrack(
+            track,
+            options,
+          );
+          this.inFlightScreenShare.set(track, publishPromise);
+          await publishPromise;
+          if (this.stolenScreenShareTracks.has(track)) {
+            // A replacement publisher took ownership while this publish was
+            // in flight; give the publication up without stopping the
+            // capture.
+            await lkRoom.localParticipant
+              .unpublishTrack(track, false)
+              .catch((e) => {
+                this.logger.error(`Failed to release stolen ${source} track`, e);
+              });
+          }
+        } catch (e) {
+          if (!this.stolenScreenShareTracks.has(track)) {
+            this.logger.error(
+              `Failed to re-publish ${source} track on new connection`,
+              e,
+            );
+            track.stop();
+          }
+        } finally {
+          this.inFlightScreenShare.delete(track);
+          this.updatePendingScreenShareSignal();
+        }
+      }
+    } finally {
+      this.publishingPendingScreenShare = false;
+      this.updatePendingScreenShareSignal();
     }
   }
 

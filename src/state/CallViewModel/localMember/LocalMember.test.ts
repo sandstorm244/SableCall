@@ -423,6 +423,9 @@ describe("LocalMembership", () => {
           // It is enought to check if destroy is called. Destroy itself is tested in the publisher to make sure it does
           // all the cleanup we need.
           destroy: vi.fn(),
+          hasScreenShareToHandOver: vi.fn().mockReturnValue(false),
+          detachScreenShareTracks: vi.fn().mockResolvedValue([]),
+          adoptScreenShareTracks: vi.fn().mockResolvedValue(undefined),
           stopPublishing: vi.fn().mockImplementation(() => {
             logger.info(`stopPublishing [${a}]`);
           }),
@@ -471,6 +474,117 @@ describe("LocalMembership", () => {
     defaultCreateLocalMemberValues.createPublisherFactory.mockReset();
   });
 
+  it("hands the screen share tracks from a destroyed publisher to its replacement", async () => {
+    const scope = new ObservableScope();
+
+    const activeTransport$ = new BehaviorSubject(aTransportWithSFUConfig);
+    const aLocalTransport: LocalTransport = {
+      advertised$: new BehaviorSubject(aTransport),
+      active$: activeTransport$,
+    };
+
+    const survivingTrack = { stop: vi.fn() } as unknown as LocalTrack;
+    const publishers: Publisher[] = [];
+    defaultCreateLocalMemberValues.createPublisherFactory.mockImplementation(
+      () => {
+        const p = {
+          destroy: vi.fn(),
+          hasScreenShareToHandOver: vi
+            .fn()
+            .mockImplementation(() => publishers.length === 1),
+          // The first publisher is sharing its screen; hand over one track.
+          detachScreenShareTracks: vi
+            .fn()
+            .mockResolvedValue(publishers.length === 0 ? [survivingTrack] : []),
+          adoptScreenShareTracks: vi.fn().mockResolvedValue(undefined),
+          stopPublishing: vi.fn(),
+          stopTracks: vi.fn(),
+        };
+        publishers.push(p as unknown as Publisher);
+        return p;
+      },
+    );
+
+    const connectionManagerData = new ConnectionManagerData();
+    connectionManagerData.add(connectionTransportAConnected, []);
+    connectionManagerData.add(connectionTransportBConnected, []);
+    createLocalMembership$({
+      scope,
+      ...defaultCreateLocalMemberValues,
+      connectionManager: {
+        connectionManagerData$: constant(new Epoch(connectionManagerData)),
+      },
+      localTransport$: new BehaviorSubject(aLocalTransport),
+    });
+    await flushPromises();
+    activeTransport$.next({
+      ...aTransportWithSFUConfig,
+      transport: bTransport,
+    });
+    await flushPromises();
+
+    expect(publishers.length).toBe(2);
+    // The recycle detaches the share from the old publisher instead of
+    // stopping it, and the replacement adopts it.
+    expect(publishers[0].detachScreenShareTracks).toHaveBeenCalled();
+    expect(publishers[0].destroy).toHaveBeenCalled();
+    expect(publishers[1].adoptScreenShareTracks).toHaveBeenCalledWith(
+      [survivingTrack],
+      undefined,
+    );
+    expect(survivingTrack.stop).not.toHaveBeenCalled();
+
+    scope.end();
+    await flushPromises();
+
+    defaultCreateLocalMemberValues.createPublisherFactory.mockReset();
+  });
+
+  it("stops the screen share capture when the scope ends mid-call", async () => {
+    const scope = new ObservableScope();
+
+    const activeTransport$ = new BehaviorSubject(aTransportWithSFUConfig);
+    const aLocalTransport: LocalTransport = {
+      advertised$: new BehaviorSubject(aTransport),
+      active$: activeTransport$,
+    };
+
+    const survivingTrack = { stop: vi.fn() } as unknown as LocalTrack;
+    defaultCreateLocalMemberValues.createPublisherFactory.mockImplementation(
+      () =>
+        ({
+          destroy: vi.fn(),
+          hasScreenShareToHandOver: vi.fn().mockReturnValue(true),
+          detachScreenShareTracks: vi.fn().mockResolvedValue([survivingTrack]),
+          adoptScreenShareTracks: vi.fn(),
+          discardPendingScreenShare: vi.fn(),
+          stopPublishing: vi.fn(),
+          stopTracks: vi.fn(),
+        }) as unknown as Publisher,
+    );
+
+    const connectionManagerData = new ConnectionManagerData();
+    connectionManagerData.add(connectionTransportAConnected, []);
+    createLocalMembership$({
+      scope,
+      ...defaultCreateLocalMemberValues,
+      connectionManager: {
+        connectionManagerData$: constant(new Epoch(connectionManagerData)),
+      },
+      localTransport$: new BehaviorSubject(aLocalTransport),
+    });
+    await flushPromises();
+
+    // Hang up: the scope ends while the connection is still live. The async
+    // cleanup detaches the capture tracks only after onEnd has already run,
+    // so the stop must happen in the cleanup itself.
+    scope.end();
+    await flushPromises();
+
+    expect(survivingTrack.stop).toHaveBeenCalled();
+    defaultCreateLocalMemberValues.createPublisherFactory.mockReset();
+  });
+
   it("only start tracks if requested", async () => {
     const scope = new ObservableScope();
 
@@ -484,6 +598,9 @@ describe("LocalMembership", () => {
           // It is enought to check if destroy is called. Destroy itself is tested in the publisher to make sure it does
           // all the cleanup we need.
           destroy: vi.fn(),
+          hasScreenShareToHandOver: vi.fn().mockReturnValue(false),
+          detachScreenShareTracks: vi.fn().mockResolvedValue([]),
+          adoptScreenShareTracks: vi.fn().mockResolvedValue(undefined),
           createAndSetupTracks: vi.fn().mockImplementation(async () => {
             tracks$.next([{}, {}] as LocalTrack[]);
             return Promise.resolve();
@@ -560,6 +677,9 @@ describe("LocalMembership", () => {
           // It is enought to check if destroy is called. Destroy itself is tested in the publisher to make sure it does
           // all the cleanup we need.
           destroy: vi.fn(),
+          hasScreenShareToHandOver: vi.fn().mockReturnValue(false),
+          detachScreenShareTracks: vi.fn().mockResolvedValue([]),
+          adoptScreenShareTracks: vi.fn().mockResolvedValue(undefined),
           createAndSetupTracks: vi.fn().mockImplementation(async () => {
             await createTrackResolver.promise;
           }),
